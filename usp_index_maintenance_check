@@ -36,7 +36,7 @@ declare @body nvarchar(max)
 
 declare @operator varchar(256) = 'DBA_ALERT'
 declare @StartDate datetime = '20171120'
-declare @profileName = 'yourProfileName'			
+declare @profileName varchar(256) = 'yourProfileName'			
 
 
 if @operator is null 
@@ -99,7 +99,7 @@ begin
 	set @body = @body + @xml + '</table></body><html>'
 
 	exec msdb..sp_send_dbmail
-	@profile_name = 'HIS_SQL_STARTUP'			
+	@profile_name = @profileName			
 	,@recipients = @operator_email
 	,@subject = 'Index Maintenance Job Alert'
 	,@body = @body
