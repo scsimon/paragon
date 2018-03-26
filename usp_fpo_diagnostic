@@ -13,6 +13,7 @@ and other things to determine if there is anythign wrong with our ordering.
 
 
 declare @databaseName varchar(64) = (select name from sys.databases where name in ('paragon', 'paragon_test'))
+declare @profileName varchar(64) = 'yourmailProfile'
 
 declare @operator varchar(256) = 'DBA_ALERT'
 
@@ -119,7 +120,7 @@ begin
 	set @body = @body + @xml + '</table></body><html>'
 
 	exec msdb..sp_send_dbmail
-	@profile_name = 'HIS_SQL_STARTUP'			
+	@profile_name = @profileName			
 	,@recipients = @operator_email
 	,@subject = 'CPOE Broker Alert'
 	,@body = @body
@@ -144,7 +145,7 @@ begin
 	set @body = @body + @xml + '</table></body><html>'
 
 	exec msdb..sp_send_dbmail
-	@profile_name = 'HIS_SQL_STARTUP'			
+	@profile_name = @profileName			
 	,@recipients = @operator_email
 	,@subject = 'FPO Service Queue'
 	,@body = @body
@@ -167,7 +168,7 @@ begin
 	set @body = @body + @xml + '</table></body><html>'
 
 	exec msdb..sp_send_dbmail
-	@profile_name = 'HIS_SQL_STARTUP'			
+	@profile_name = @profileName			
 	,@recipients = @operator_email
 	,@subject = 'Scheduled Order Dates Are Behind'
 	,@body = @body
