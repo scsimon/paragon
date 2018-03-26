@@ -1,0 +1,179 @@
+/************************************************************************************************************************
+This was created based off service order XXXX in effort to reproduce the report from
+AllScripts which checks the status of brokers, queues, correction lists, restoration correction lists,
+and other things to determine if there is anythign wrong with our ordering. 
+
+
+12/26/2017		S.Simon		Created Proc
+************************************************************************************************************************/
+
+
+--create procedure usp_fpo_diagnostic (@operator varchar(256) = null)
+--as
+
+
+declare @databaseName varchar(64) = (select name from sys.databases where name in ('paragon', 'paragon_test'))
+
+declare @operator varchar(256) = 'DBA_ALERT'
+
+declare @xml nvarchar(max)
+declare @body nvarchar(max)
+
+
+if @operator is null 
+begin
+	set @operator = 'DBA_ALERT'
+end
+declare @operator_email varchar(256) = (select email_address from msdb..sysoperators where upper([name]) = upper(@operator))
+
+
+--Check to make sure the SQL Server Service Broker is enabled
+if object_id('tempdb..#Broker') is not null drop table #Broker
+select 
+	DBName = name
+	,IsBrokerEnabled = is_broker_enabled
+into #Broker
+from sys.databases
+where name = @databaseName
+
+
+--Check the CPOE broker
+if object_id('tempdb..#CPOE_Broker') is not null drop table #CPOE_Broker
+select
+	Parameter = parm_ds
+	,ParameterCode = parm_ext_id
+	,DefaultValue = def_val_cd
+	,ParameterValue = case when fac_ctl_fg = 'N' then 'Default' else 'Changed by SAMC' end
+	,LastModBy = lst_mod_id
+	,LastMod = lst_mod_ts
+	,TheTable = 'TSM990_SYS_PARMS'
+into #CPOE_Broker
+from TSM990_SYS_PARMS
+where 
+	row_sta_cd = 'A'
+	and parm_ext_id = 'COE_FPO_OMS_FG'
+order by 
+	parm_ds
+
+
+
+--Make sure the PSO / PSL / PSR / PST dates are set to the future.
+if object_id('tempdb..#OrderDates') is not null drop table #OrderDates
+select
+	shutdown_flag
+	,PSL = process_scheduled_lab_ts
+	,PSO = process_future_dept_ts
+	,PST = thp_sch_lst_pcs_ts
+	,PSR = pcs_sch_rad_ts
+into #OrderDates
+from
+	TOM997_SPEC_RECORD_1
+
+
+
+--Check FPO Queues
+if object_id('tempdb..#FPO_Queue') is not null drop table #FPO_Queue
+select
+	QueueName = name
+	,ActivationStatus = isnull(cast(is_activation_enabled as int),0)		--Specifies whether an activation stored procedure is run to receive messages from the queue
+	,EnqueueStatus = isnull(cast(is_enqueue_enabled as int),0)			--Specifies whether new messages can be placed in the queue
+	,ActivationProcedure = activation_procedure
+	,TheTable = 'sys.service_queues'
+	,Resolution = case when is_enqueue_enabled = 0 or is_activation_enabled = 0 then 'Open a McKesson Service Order -- ALTER QUEUE <...> WITH STATUS = ON' end
+into #FPO_Queue
+from 
+	sys.service_queues
+where 
+	name like 'FPO%';
+
+
+--Send email if broker isn't enabled
+if(select IsBrokerEnabled from #Broker) <> 1
+begin
+
+	set @body = '<h2>The service broker for paragon on is disabled</h2>'
+
+	exec msdb..sp_send_dbmail
+	@profile_name = 'HIS_SQL_STARTUP'			
+	,@recipients = @operator_email
+	,@subject = 'Service Broker Alert'
+	,@body = @body
+	,@body_format = 'HTML'
+
+end
+
+
+--Send email if CPOE Broker isn't enabled
+if(select DefaultValue from #CPOE_Broker) <> 'Y'
+begin
+
+	set @xml = cast(( select [ParameterCode] as 'td', '', [Parameter] as 'td', '', [DefaultValue] as 'td', '', [ParameterValue] as 'td', '', [LastModBy] as 'td', '', [LastMod] as 'td', '', [TheTable] as 'td'
+					  from #CPOE_Broker
+					  for xml path('tr'), elements ) as nvarchar(max))
+
+	set @body = '<html><body><H3>CPOE Broker Alert</H3>
+				 <table border = 1>
+				 <tr>
+				 <th>ParameterCode</th> <th>Parameter</th> <th>DefaultValue</th> <th>ParameterValue</th> <th>LastModBy</th> <th>LastMod</th> <th>TheTable</th>'
+
+	set @body = @body + @xml + '</table></body><html>'
+
+	exec msdb..sp_send_dbmail
+	@profile_name = 'HIS_SQL_STARTUP'			
+	,@recipients = @operator_email
+	,@subject = 'CPOE Broker Alert'
+	,@body = @body
+	,@body_format = 'HTML'
+
+end
+
+
+--Send email if service queues aren't enabled
+if (select min(ActivationStatus) + min(EnqueueStatus) from #FPO_Queue) <> 2
+begin
+
+	set @xml = cast(( select [QueueName] as 'td', '', [ActivationStatus] as 'td', '', [EnqueueStatus] as 'td', '', [ActivationProcedure] as 'td', '', [TheTable] as 'td', '', [Resolution] as 'td'
+					  from #FPO_Queue where ActivationStatus = 0 or EnqueueStatus = 0
+					  for xml path('tr'), elements ) as nvarchar(max))
+
+	set @body = '<html><body><H3>FPO Service Queue Alert</H3>
+				 <table border = 1>
+				 <tr>
+				 <th>QueueName</th> <th>ActivationStatus</th> <th>EnqueueStatus</th> <th>ActivationProcedure</th> <th>TheTable</th> <th>Resolution</th>'
+
+	set @body = @body + @xml + '</table></body><html>'
+
+	exec msdb..sp_send_dbmail
+	@profile_name = 'HIS_SQL_STARTUP'			
+	,@recipients = @operator_email
+	,@subject = 'FPO Service Queue'
+	,@body = @body
+	,@body_format = 'HTML'
+end
+
+
+--Send email if schedule dates aren't in the future
+if(select (select min(v) from (values (PSL), (PSO), (PST), (PSR)) as value(v)) as MaxDate from #OrderDates) < getdate()
+begin
+	set @xml = cast(( select [shutdown_flag] as 'td', '', [PSL] as 'td', '', [PSO] as 'td', '', [PST] as 'td', '', [PSR] as 'td'
+					  from #OrderDates 
+					  for xml path('tr'), elements ) as nvarchar(max))
+
+	set @body = '<html><body><H3>Scheduled Order Dates Are Behind</H3>
+				 <table border = 1>
+				 <tr>
+				 <th>shutdown_flag</th> <th>PSL</th> <th>PSO</th> <th>PST</th> <th>PSR</th>'
+
+	set @body = @body + @xml + '</table></body><html>'
+
+	exec msdb..sp_send_dbmail
+	@profile_name = 'HIS_SQL_STARTUP'			
+	,@recipients = @operator_email
+	,@subject = 'Scheduled Order Dates Are Behind'
+	,@body = @body
+	,@body_format = 'HTML'
+end
+
+
+
+
