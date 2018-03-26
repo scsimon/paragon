@@ -1,0 +1,159 @@
+
+/****************************************************************************************************************
+Procedure to query the Index Maintenance tables which McKesson / AllScripts populates during their
+reindex jobs. If an index is skipped due to a threshold being met, or the job fails to finish due to
+the paragon log size or the total time of execution for the job, and email is fired to the operator passed in.
+If no operator or date is passed in, the DBA_ALERT operator is used, and the date is the current date.
+
+
+2017-10-23		S.Simon		Created Proc
+
+McKesson Index Jobs (For Reference)
+
+mck paragon - Index Maintenance - Offline
+mck paragon - Index Maintenance - Online - Daily
+
+ONLINE Index mode builds a new index while the old index is accessible and used
+for read and writes. Once it is complete, the table is locked and the old
+index is replaced with the new one.
+
+OFFLINE Index mode locks the table, preventing any reads or writes (excluding nolock hints)
+and the index is rebuilt. Once it's done, the lock is released and the new index is used.
+
+****************************************************************************************************************/
+
+
+--CREATE procedure [dbo].[usp_index_maintenance_check](
+--													@operator varchar(256) = null
+--													,@StartDate datetime = null
+--												)
+--as
+
+
+
+declare @xml nvarchar(max)
+declare @body nvarchar(max)
+
+declare @operator varchar(256) = 'DBA_ALERT'
+declare @StartDate datetime = '20171120'
+declare @profileName = 'yourProfileName'			
+
+
+if @operator is null 
+begin
+	set @operator = 'DBA_ALERT'
+end
+
+if @StartDate is null
+begin
+	set @StartDate = cast(getdate() as date)
+end
+else
+begin
+	set @StartDate = cast(@StartDate as date)
+end
+
+
+declare @operator_email varchar(256) = (select email_address from msdb..sysoperators where upper([name]) = upper(@operator))
+
+
+
+if exists(select 1 from TDB210_IDX_HST where (max_pct_log_full >= percent_log_full or run_time >= cast(dateadd(minute,max_run_min,0) as time)) and cast(dt_tm as date) >= @StartDate)
+begin
+
+	if object_id('tempdb..#HST') is not null drop table #HST
+	create table #HST(
+						TheDate datetime null
+						,JobEarlyTerminationReason varchar(1000) null
+						)
+
+	insert into #HST
+	select 
+		TheDate = dt_tm
+		,JobEarlyTerminationReason = 
+		case 
+			when run_time >= cast(dateadd(minute,max_run_min,0) as time)
+				then 'The Job took longer to run than the @max_run_min parameter, and thus exited before all indexes were finished rebuilding / reorganizing'
+			when max_pct_log_full >= percent_log_full	
+				then 'Paragon Log was too full to finish the job. Increase Log Size'
+		end
+	from 
+		TDB210_IDX_HST 
+	where
+		(max_pct_log_full >= percent_log_full						--log size is being exceeded before all indezed are defragmented. We need to increase the size of the Paragon log file
+		or run_time >= cast(dateadd(minute,max_run_min,0) as time))	--run time has been exceeded before all indexes are defragmented. @max_run_min must me increased
+		and cast(dt_tm as date) >= @StartDate						
+	order by 
+		dt_tm desc
+
+
+	set @xml = cast(( select [TheDate] as 'td', '', [JobEarlyTerminationReason] as 'td' 
+					  from #HST
+					  for xml path('tr'), elements ) as nvarchar(max))
+
+	set @body = '<html><body><H3>Index Maintenance Job Alert</H3>
+				 <table border = 1>
+				 <tr>
+				 <th>TheDate</th> <th>JobEarlyTerminationReason</th>'
+
+	set @body = @body + @xml + '</table></body><html>'
+
+	exec msdb..sp_send_dbmail
+	@profile_name = 'HIS_SQL_STARTUP'			
+	,@recipients = @operator_email
+	,@subject = 'Index Maintenance Job Alert'
+	,@body = @body
+	,@body_format = 'HTML'
+
+end
+
+
+
+if exists (select 1 from TDB200_IDX_MAINT where dfg_typ is null and cast(dt_tm as date) >= @StartDate)
+begin
+	
+
+	if object_id('tempdb..#MAINT') is not null drop table #MAINT
+	create table #MAINT(
+						TableName varchar(256) null
+						,IndexName varchar(256) null
+						,FragPercent int null
+						,TheDate datetime null
+						,IndexJob varchar(64)
+						)
+
+	insert into #MAINT
+	select 
+			TableName = tbl
+			,IndexName = idx
+			,FragPercent = frag_pct
+			,TheDate = dt_tm
+			,case when datepart(weekday,dt_tm) in (1,7) then 'Offline Index' else 'Online Index' end  --if the date is a weekend, the rebuild was an offline rebuild based on job schedule. Onlines are done weekdays
+		from 
+			TDB200_IDX_MAINT 
+		where
+			dfg_typ is null										--index defrag did not complete before a threahold was exceeded
+			and cast(dt_tm as date) >= @StartDate
+		order by 
+			dt_tm desc
+
+	set @xml = cast(( select [TableName] as 'td', '', [IndexName] as 'td', '', [FragPercent] as 'td', '', [TheDate] as 'td', '', [IndexJob] as 'td' 
+					  from #MAINT
+					  for xml path('tr'), elements ) as nvarchar(max))
+
+	set @body = '<html><body><H3>Table Index Job Alert - The Following Indexes Were Skipped</H3>
+				 <table border = 1>
+				 <tr>
+				 <th>TableName</th> <th>IndexName</th> <th>FragPercent</th> <th>TheDate</th> <th>IndexJob</th>'
+
+	set @body = @body + @xml + '</table></body><html>'
+	
+	exec msdb..sp_send_dbmail
+	@profile_name = @profileName			
+	,@recipients = @operator_email
+	,@subject = 'Table Index Job Alert'
+	,@body = @body
+	,@body_format = 'HTML'
+end
+
+GO
