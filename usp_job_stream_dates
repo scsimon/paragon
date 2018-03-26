@@ -1,0 +1,163 @@
+/*****************************************************************************************************************
+Proc to send an email if the Job Stream Processing Dates aren't where they should be
+Most logic was taken from the print statement in the PSO_PSL_Dates_Manual_Closing.sql script from AllScripts
+
+@emailAlert = 1 will send an email only if the dates are messed up
+@emailAlert = 0 will return the current state just for display / debugging
+
+12/16/2017		S.Simon		Created Proc
+*****************************************************************************************************************/
+
+--create procedure usp_job_stream_dates_check(@operator varchar(64) = null
+--												,@emailAlert bit = 1)
+
+--as
+
+declare @operator varchar(64) = null
+declare @emailAlert bit = 1
+declare @profileName varchar(64) = 'yourMailProfile'
+
+if @operator is null 
+begin
+	set @operator = 'DBA_ALERT'
+end
+
+
+declare @operator_email varchar(256) = (select email_address from msdb..sysoperators where upper([name]) = upper(@operator))
+declare @theSubject varchar(256) = (select @@SERVERNAME + ' Job Stream Processing Dates Alert')
+declare @xml varchar(max)
+declare @body varchar(max)
+declare @currentDate date = cast(getdate() as date)
+declare @yesterdayDate date = dateadd(day,-1,getdate())
+
+if object_id('tempdb..#JobStreamDates') is not null drop table #JobStreamDates
+select
+	DateType = cast('PSL Date' as varchar(64))
+	,TheDate = cast(process_scheduled_lab_ts as date)
+	,ShouldMatch = @currentDate
+into #JobStreamDates
+from
+	TOM997_SPEC_RECORD_1
+
+union all
+
+select
+	DateType = 'PSO Date'
+	,TheDate = cast(process_future_dept_ts as date)
+	,ShouldMatch = @currentDate
+from
+	TOM997_SPEC_RECORD_1
+
+union all
+
+select
+	DateType = 'Therapy Schedule Date'
+	,TheDate = cast(thp_sch_lst_pcs_ts as date)
+	,ShouldMatch = @currentDate
+from
+	TOM997_SPEC_RECORD_1
+
+
+union all
+
+select
+	DateType = 'PSR Date'
+	,TheDate = cast(pcs_sch_rad_ts as date)
+	,ShouldMatch = @currentDate
+from
+	TOM997_SPEC_RECORD_1
+
+union all
+
+select
+	DateType = 'Action List Date'
+	,TheDate = cast(acn_lst_pcs_ts as date)
+	,ShouldMatch = @currentDate
+from
+	TOM997_SPEC_RECORD_1
+
+union all
+
+select
+	DateType = 'Last Charged Date'
+	,TheDate = cast(last_charged_datetime as date)
+	,ShouldMatch =@yesterdayDate
+from
+	TOM997_SPEC_RECORD_1
+
+insert into #JobStreamDates
+select
+	case 
+		when parm_ext_id = 'PM_RB_SERV_DT' then 'Room and Bed Date'
+		when parm_ext_id = 'PM_RPT_DT_TM' then 'Report Date'
+		when parm_ext_id = 'PM_BILL_DATE' then 'Bill Date'
+		when parm_ext_id = 'REPRINT_RPTS' then 'Reprint Reports Date' 
+	end 
+	,cast(def_val_cd as date)
+	,case 
+		when parm_ext_id = 'PM_RB_SERV_DT' then @currentDate
+		when parm_ext_id = 'PM_RPT_DT_TM' then @currentDate
+		when parm_ext_id = 'PM_BILL_DATE' then @yesterdayDate
+		when parm_ext_id = 'REPRINT_RPTS' then @yesterdayDate
+	end 
+FROM 
+	TSM990_SYS_PARMS 
+WHERE parm_ext_id in ('PM_RB_SERV_DT','PM_RPT_DT_TM','PM_BILL_DATE','REPRINT_RPTS')
+
+
+
+if @emailAlert = 0
+begin
+	select *
+	from #JobStreamDates 
+	order by case
+				when DateType = 'PSL Date' then 1
+				when DateType = 'PSO Date' then 2
+				when DateType = 'PSR Date' then 3
+				when DateType = 'Room and Bed Date' then 4
+				when DateType = 'Report Date' then 5
+				when DateType = 'Therapy Schedule Date' then 6
+				when DateType = 'Action List Date' then 7
+				when DateType = 'Bill Date' then 8
+				when DateType = 'Reprint Reports Date' then 9
+				when DateType = 'Last Charged Date' then 10
+	 		end
+end
+else
+begin
+	--send email if dates are jacked up...
+	if exists(select 1 from #JobStreamDates where TheDate <> ShouldMatch)
+	begin
+
+		set @xml = cast(( select [DateType] as 'td', '', [TheDate] as 'td', '', [ShouldMatch] as 'td'
+						  from #JobStreamDates 
+						  order by case
+										when DateType = 'PSL Date' then 1
+										when DateType = 'PSO Date' then 2
+										when DateType = 'PSR Date' then 3
+										when DateType = 'Room and Bed Date' then 4
+										when DateType = 'Report Date' then 5
+										when DateType = 'Therapy Schedule Date' then 6
+										when DateType = 'Action List Date' then 7
+										when DateType = 'Bill Date' then 8
+										when DateType = 'Reprint Reports Date' then 9
+										when DateType = 'Last Charged Date' then 10
+	 									end
+						  for xml path('tr'), elements ) as nvarchar(max))
+
+		set @body = '<html><body><H3>Job Stream Processing Dates Are Behind</H3>
+					<table border = 1>
+					<tr>
+					<th>DateType</th> <th>TheDate</th> <th>ShouldMatch</th>'
+
+		set @body = @body + @xml + '</table></body><html>'
+
+
+		exec msdb..sp_send_dbmail
+		@profile_name = @profileName			
+		,@recipients = @operator_email
+		,@subject = @theSubject
+		,@body = @body
+		,@body_format = 'HTML'
+	end
+end
