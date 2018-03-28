@@ -1,163 +1,571 @@
-/*****************************************************************************************************************
-Proc to send an email if the Job Stream Processing Dates aren't where they should be
-Most logic was taken from the print statement in the PSO_PSL_Dates_Manual_Closing.sql script from AllScripts
 
-@emailAlert = 1 will send an email only if the dates are messed up
-@emailAlert = 0 will return the current state just for display / debugging
+/*********************************************************************************************************************************
+Proc to alert an operator or email address of job stream status, history, etc... or can be used adhoc.
 
-12/16/2017		S.Simon		Created Proc
-*****************************************************************************************************************/
+//need to add logic for when a job never stops running (like FMR problem...) which causes it to look like it's skipped
 
---create procedure usp_job_stream_dates_check(@operator varchar(64) = null
---												,@emailAlert bit = 1)
+2018-03-26		S.Simon		Created Proc
+2018-03-28		S.Simon		Added one step in coalese for Error message to not be 'Job Not Started or Was Skipped / Disabled'
+							if the job was running. If the job is running but there was no error / status, this was being returned
+							which is false, because it is running
+*********************************************************************************************************************************/
 
+
+--alter procedure [dbo].[usp_job_stream_status](
+--											@returnOnlyUncomplete bit = 1
+--											,@returnCurrentlyRunning bit = 0
+--											,@daysBack int = 1
+--											,@nightlyStartTime time = '22:00:00'
+--											,@operator varchar(16) = null
+--											,@emails varchar(4000) = null
+--											,@emailProfile varchar(28) = null
+--											,@emailResults bit = 0)
+--
+--
 --as
 
-declare @operator varchar(64) = null
-declare @emailAlert bit = 1
-declare @profileName varchar(64) = 'yourMailProfile'
 
-if @operator is null 
+declare @returnOnlyUncomplete bit = 1			--1 = jobs haven't completly finished or skipped | 0 = all results
+declare @returnCurrentlyRunning bit = 0			--0 = skipped | 1 = returns seperate set from above of only running / hung queries... not used in email alerts
+declare @daysBack int = 1						--Days back to return results. Set to 1 if running daily via job
+declare @nightlyStartTime time = '22:00:00'		--define when your nightly jobs kicks off
+
+declare @operator varchar(16) = null			--operator in SQL Server that gets emailed. It's important to schedule the job at the right time
+declare @emails varchar(4000) = null			--this is used if @operator isn't specified. @emails takes priority
+declare @emailProfile varchar(28) = null		--name of the DB Mail profile used to send emails from SQL Server
+declare @emailResults bit = 0					--1 emails, 0 returns results
+
+
+---------------------------------------------------------------------------------
+--populate the jobs your org uses
+--done this way in case an org stopped using a job that was configured
+--I didn't find anythign in TJS100 that was reliable
+---------------------------------------------------------------------------------
+
+if object_id('tempdb..#NightlyJobs') is not null
+drop table #NightlyJobs
+
+create table #NightlyJobs (JobName varchar(256))
+insert into #NightlyJobs
+values
+('1 - Nightly Capture Cens'),
+('2 - Nightly Closing'),
+('2a - Closing Reports'),
+('2b - Bill Processing'),
+('3 - Finish Nightly Closing'),
+('ATB - Scheduled ATB'),
+('AU - Statements'),
+('CCS - Generate Action List'),
+('COE - CPOE Orders to HPF'),
+('HPF - Transfer FMR'),
+('MAR - Transfer MedAdmin Report'),
+('MRR - Transfer MedRecon Report'),
+--('PAT - Transfer Patient Profile'),
+('PAY - Payor Log'),
+('PSL - Scheduled Lab'),
+('PSO - Scheduled Orders'),
+('PSR - Scheduled Rad'),
+('ZZ - Interface Charges')
+
+
+---------------------------------------------------------------------------------
+--get the default @mailProfile for db_mail if one isn't passed in
+---------------------------------------------------------------------------------
+
+if @emailProfile is null and @emailResults = 1
 begin
-	set @operator = 'DBA_ALERT'
+
+	--exec msdb.dbo.sysmail_help_profile_sp 
+	--exec msdb.dbo.sysmail_help_account_sp 
+
+	if object_id('tempdb..#profile') is not null drop table #profile
+	create table #profile (  principal_id int
+							,principal_name varchar(256)
+							,profile_id int
+							,profile_name varchar(256)
+							,is_default bit)
+
+	insert into #profile
+	exec msdb.dbo.sysmail_help_principalprofile_sp  
+
+	set @emailProfile = (select top 1 profile_name from #profile where is_default = 1)
 end
 
 
-declare @operator_email varchar(256) = (select email_address from msdb..sysoperators where upper([name]) = upper(@operator))
-declare @theSubject varchar(256) = (select @@SERVERNAME + ' Job Stream Processing Dates Alert')
-declare @xml varchar(max)
-declare @body varchar(max)
-declare @currentDate date = cast(getdate() as date)
-declare @yesterdayDate date = dateadd(day,-1,getdate())
+--suppose they didn't set a default? Get an arbritary one...
 
-if object_id('tempdb..#JobStreamDates') is not null drop table #JobStreamDates
-select
-	DateType = cast('PSL Date' as varchar(64))
-	,TheDate = cast(process_scheduled_lab_ts as date)
-	,ShouldMatch = @currentDate
-into #JobStreamDates
-from
-	TOM997_SPEC_RECORD_1
-
-union all
-
-select
-	DateType = 'PSO Date'
-	,TheDate = cast(process_future_dept_ts as date)
-	,ShouldMatch = @currentDate
-from
-	TOM997_SPEC_RECORD_1
-
-union all
-
-select
-	DateType = 'Therapy Schedule Date'
-	,TheDate = cast(thp_sch_lst_pcs_ts as date)
-	,ShouldMatch = @currentDate
-from
-	TOM997_SPEC_RECORD_1
-
-
-union all
-
-select
-	DateType = 'PSR Date'
-	,TheDate = cast(pcs_sch_rad_ts as date)
-	,ShouldMatch = @currentDate
-from
-	TOM997_SPEC_RECORD_1
-
-union all
-
-select
-	DateType = 'Action List Date'
-	,TheDate = cast(acn_lst_pcs_ts as date)
-	,ShouldMatch = @currentDate
-from
-	TOM997_SPEC_RECORD_1
-
-union all
-
-select
-	DateType = 'Last Charged Date'
-	,TheDate = cast(last_charged_datetime as date)
-	,ShouldMatch =@yesterdayDate
-from
-	TOM997_SPEC_RECORD_1
-
-insert into #JobStreamDates
-select
-	case 
-		when parm_ext_id = 'PM_RB_SERV_DT' then 'Room and Bed Date'
-		when parm_ext_id = 'PM_RPT_DT_TM' then 'Report Date'
-		when parm_ext_id = 'PM_BILL_DATE' then 'Bill Date'
-		when parm_ext_id = 'REPRINT_RPTS' then 'Reprint Reports Date' 
-	end 
-	,cast(def_val_cd as date)
-	,case 
-		when parm_ext_id = 'PM_RB_SERV_DT' then @currentDate
-		when parm_ext_id = 'PM_RPT_DT_TM' then @currentDate
-		when parm_ext_id = 'PM_BILL_DATE' then @yesterdayDate
-		when parm_ext_id = 'REPRINT_RPTS' then @yesterdayDate
-	end 
-FROM 
-	TSM990_SYS_PARMS 
-WHERE parm_ext_id in ('PM_RB_SERV_DT','PM_RPT_DT_TM','PM_BILL_DATE','REPRINT_RPTS')
-
-
-
-if @emailAlert = 0
+if @emailProfile is null and @emailResults = 1
 begin
-	select *
-	from #JobStreamDates 
-	order by case
-				when DateType = 'PSL Date' then 1
-				when DateType = 'PSO Date' then 2
-				when DateType = 'PSR Date' then 3
-				when DateType = 'Room and Bed Date' then 4
-				when DateType = 'Report Date' then 5
-				when DateType = 'Therapy Schedule Date' then 6
-				when DateType = 'Action List Date' then 7
-				when DateType = 'Bill Date' then 8
-				when DateType = 'Reprint Reports Date' then 9
-				when DateType = 'Last Charged Date' then 10
-	 		end
+	set @emailProfile = (select top 1 profile_name from #profile)
+end
+
+---------------------------------------------------------------------------------
+--get @operator email if the param was used, otherwise use @email
+---------------------------------------------------------------------------------
+
+
+if(@operator is null and @emails is null and @emailResults = 1)
+begin
+	raiserror('Email or Operator is required when @emailResults = 1',16,1)
+	return
 end
 else
 begin
-	--send email if dates are jacked up...
-	if exists(select 1 from #JobStreamDates where TheDate <> ShouldMatch)
+	declare @operator_email varchar(4000) = coalesce(@emails,(select email_address from msdb..sysoperators where upper([name]) = upper(@operator)))
+
+	if (@operator_email is null and @emailResults = 1)
+		begin
+			declare @errMsg varchar(600) = 'No email address set for operator ' + @operator + ' or operator does not exist'
+			raiserror(@errMsg,16,1)
+			return
+		end
+end
+
+
+---------------------------------------------------------------------------------
+--set some variables for emailing if needed
+---------------------------------------------------------------------------------
+
+if (@emailResults = 1)
+begin
+	declare @xml nvarchar(max)
+	declare @body nvarchar(max)
+	declare @subject varchar(4000)
+	declare @server varchar(256) = (select @@SERVERNAME)
+end
+
+---------------------------------------------------------------------------------
+--set the startTime for limiting results
+---------------------------------------------------------------------------------
+
+declare @startTime datetime = convert(varchar(12),dateadd(day,@daysBack * (-1),getdate()),112) + ' ' + cast(@nightlyStartTime as varchar(8))
+
+
+---------------------------------------------------------------------------------
+--GET CURRENT RUNNING JOBS
+
+--I'm not sure when the status is updated, but you can kill the jobs stream 
+--completely, via task manager, and it will still show a job as running.
+
+--However, the lst_mod_ts will be old, so that could be an indicator of a hung job.
+--If you re-load JobStream, the state (status and error) should match these results
+---------------------------------------------------------------------------------
+
+if object_id('tempdb..#JobStreamCurrentlyRunning') is not null
+drop table #JobStreamCurrentlyRunning
+
+select 
+	jm.job_int_id
+	,JobName = jm.name
+	,JobDesc = jm.description
+	,StepCommand = step.command
+	,StepType = 
+				case 
+					when step.command_type = 1 then 'Stored Proc'
+					when step.command_type = 2 then 'Job Stream'
+					when step.command_type = 3 then 'Executable'
+					when step.command_type = 4 then 'Report'
+					when step.command_type = 6 then 'User Report' 
+				end
+	,StepOutput = 
+				case 
+					when step.output = 1 then 'None'
+					when step.output = 2 then 'ASCII File'
+					when step.output = 3 then 'Printer File'
+					when step.output = 4 then 'Default Printer' 
+				end
+	,StepDesc = step.job_sep_ds
+	,StepSeqNo = step.sequence_no
+	,JobStatusStartTime = stat.start_time
+	,JobRunDuration = convert(varchar, dateadd(millisecond, datediff(second,stat.start_time,getdate()) * 1000, 0), 114) --only works for < 24 hours
+	,JobStatusEndTime = stat.end_time --will always be null cause it seems to purge records when it's finished?
+	,JobStatus =
+			case
+				when stat.status = 1 then 'Started'
+				when stat.status = 2 then 'Finished'
+				when stat.status = 3 then 'Error'
+				when stat.status = 4 then 'Cancelled'
+				--should be a status for skipped and restarted too
+			end
+	,JobStatusError = stat.err_message
+	,JobStatusLastMod = stat.lst_mod_ts
+	,MinutesSinceStatusUpdate = DateDiff(minute,stat.lst_mod_ts,getdate())
+	,UserID = stat.userid
+into #JobStreamCurrentlyRunning
+from
+	TJS100_JOBMASTER jm
+	inner join 
+		TJS101_JOBSTEP step on
+		step.job_int_id = jm.job_int_id
+		and step.row_sta_cd = 'A'
+
+	left join 
+		TJS103_JOBSTATUS stat on
+		stat.job_int_id = jm.job_int_id
+		and stat.step_int_id = step.jobstep_int_id
+		and stat.row_sta_cd = 'A'
+where
+	jm.row_sta_cd = 'A'
+	and stat.start_time is not null
+	and end_time is null
+order by
+		jm.job_int_id
+
+
+		
+---------------------------------------------------------------------------------
+--Get the job history... 
+--The idea here is to match Job Status History tab in Job Stream
+
+--Some jobs don't start at step 1, or 2, or whatever... 
+--because the step can be obsolete with a row_sta_cd of O or I
+
+--Additionally, we are able to only return jobs which haven't 
+--completly finished today based off last job step seq_no 
+--and the @returnOnlyUncomplete parameter
+---------------------------------------------------------------------------------
+
+if object_id('tempdb..#JobStreamStaging') is not null
+drop table #JobStreamStaging
+
+select 
+	jm.job_int_id
+	,JobName = jm.name
+	,JobDesc = jm.description
+	,UserID = jh.userid
+	,Command =
+				case 
+					when step.command = '75' then 'Automated Statements'
+					when step.command = '69' then 'Process Scheduled ATB/AR Analysis'
+					when step.command = '90' then 'Payor Log'
+					when step.command = '20' then 'Closing Report Processing'
+					else step.command
+				end
+	,StartTime = jh.start_time
+	,EndTime = jh.end_time
+	,Status =
+						case
+							when jh.status = 1 then 'Started'
+							when jh.status = 2 then 'Finished'
+							when jh.status = 3 then 'Error'
+							when jh.status = 4 then 'Cancelled'
+							else 'UNK Code'
+						end
+	,Error = isnull(jh.err_message,'')
+	,JobStepDesc = step.job_sep_ds
+	,JobStepSeqNo = step.sequence_no
+	,LastJobStepRan = max(step.sequence_no) over (partition by jm.job_int_id)
+into #JobStreamStaging
+from 
+	TJS100_JOBMASTER jm 
+	inner join 
+		TJS101_JOBSTEP step on
+		step.job_int_id = jm.job_int_id
+		and step.row_sta_cd = 'A'
+	inner join	
+		TJS104_JOBSTATUSHISTORY jh on
+		jm.job_int_id = jh.job_int_id
+		and jh.step_int_id = step.jobstep_int_id
+		and jh.row_sta_cd = 'A'
+where
+	jm.row_sta_cd = 'A'
+	and jh.start_time >= @startTime
+
+
+
+
+---------------------------------------------------------------------------------
+--return results when no email is wanted
+---------------------------------------------------------------------------------
+
+if (@emailResults = 0)
+begin
+
+	if (@returnCurrentlyRunning = 1)
 	begin
-
-		set @xml = cast(( select [DateType] as 'td', '', [TheDate] as 'td', '', [ShouldMatch] as 'td'
-						  from #JobStreamDates 
-						  order by case
-										when DateType = 'PSL Date' then 1
-										when DateType = 'PSO Date' then 2
-										when DateType = 'PSR Date' then 3
-										when DateType = 'Room and Bed Date' then 4
-										when DateType = 'Report Date' then 5
-										when DateType = 'Therapy Schedule Date' then 6
-										when DateType = 'Action List Date' then 7
-										when DateType = 'Bill Date' then 8
-										when DateType = 'Reprint Reports Date' then 9
-										when DateType = 'Last Charged Date' then 10
-	 									end
-						  for xml path('tr'), elements ) as nvarchar(max))
-
-		set @body = '<html><body><H3>Job Stream Processing Dates Are Behind</H3>
-					<table border = 1>
-					<tr>
-					<th>DateType</th> <th>TheDate</th> <th>ShouldMatch</th>'
-
-		set @body = @body + @xml + '</table></body><html>'
+		select
+			job_int_id
+			,JobName
+			,JobDesc
+			,StepCommand
+			,StepType
+			,StepOutput
+			,StepDesc
+			,StepSeqNo
+			,JobStatus
+			,JobStatusStartTime
+			,JobStatusEndTime
+			,JobRunDuration
+			,JobStatusError
+			,JobStatusLastMod
+			,MinutesSinceStatusUpdate
+			,UserID
+		from #JobStreamCurrentlyRunning
+	end
 
 
-		exec msdb..sp_send_dbmail
-		@profile_name = @profileName			
-		,@recipients = @operator_email
-		,@subject = @theSubject
-		,@body = @body
-		,@body_format = 'HTML'
+	if (@returnOnlyUncomplete = 0)
+	begin
+		select
+			JobName
+			,JobDesc
+			,UserID
+			,Command
+			,StartTime 
+			,EndTime 
+			,Status
+			,Error
+			,JobStepDesc
+			,JobStepSeqNo 
+		from #JobStreamStaging
+		--order seen in job status history tab in job stream
+		order by
+			StartTime desc
+			,EndTime desc
+			,JobStepSeqNo desc
+	end
+	else
+	begin
+		--will return currently running jobs as well as jobs that were skipped / didn't run at all, or failed to complete their last step
+		select
+			allJobs.JobName
+			,JobDesc = coalesce(jscr.JobDesc,js.JobDesc,'')
+			,UserID = coalesce(jscr.UserID,js.UserID,'')
+			,Command = coalesce(jscr.StepCommand,js.Command,'')
+			,StartTime = coalesce(jscr.JobStatusStartTime, js.StartTime) 
+			,js.EndTime 
+			,Status = coalesce(jscr.JobStatus, js.Status,'')
+			,Error = coalesce(jscr.JobStatusError,js.Error,case when coalesce(jscr.JobStatusStartTime, js.StartTime) is not null then '' end,'Job Not Started or Was Skipped / Disabled')
+			,JobStepDesc = coalesce(jscr.StepDesc,js.JobStepDesc,'')
+			,LastOrCurrentStep = coalesce(jscr.StepSeqNo,js.JobStepSeqNo,'') 
+			,FirstStepInJob = allJobs.FirstActiveStep
+			,LastStepInJob = allJobs.LastActiveStep
+			,TotalNumOfSteps
+			,JobRunDuration = coalesce(jscr.JobRunDuration,'')
+			,MinutesSinceStatusUpdate = coalesce(jscr.MinutesSinceStatusUpdate,'')
+		from 
+			(select 
+				jm.job_int_id
+				,JobName = jm.name
+				,TotalNumOfSteps = count(*)
+				,FirstActiveStep = min(step.sequence_no)
+				,LastActiveStep = max(step.sequence_no)
+			from TJS100_JOBMASTER jm 
+			left join 
+				TJS101_JOBSTEP step on
+				jm.job_int_id = step.job_int_id
+			where
+				jm.row_sta_cd = 'A'
+				and jm.name in (select JobName from #NightlyJobs)
+				and step.row_sta_cd = 'A'
+			group by
+				jm.name
+				,jm.job_int_id) allJobs
+			left join
+				(select distinct job_int_id, LastJobStepRan
+				 from #JobStreamStaging) stat on
+				 stat.job_int_id = allJobs.job_int_id 
+				 and stat.LastJobStepRan = allJobs.LastActiveStep
+			left join
+				#JobStreamStaging js on
+				js.job_int_id = allJobs.job_int_id
+			left join
+				#JobStreamCurrentlyRunning jscr on
+				jscr.job_int_id = allJobs.job_int_id
+		where
+			stat.LastJobStepRan is null
+		--order seen in job status history tab in job stream
+		order by
+			coalesce(jscr.JobStatusStartTime, js.StartTime) desc
+			,js.EndTime desc
+			,coalesce(jscr.StepSeqNo,js.JobStepSeqNo) desc
+	end
+
+end
+
+
+
+---------------------------------------------------------------------------------
+--return formated email of table results
+---------------------------------------------------------------------------------
+
+if (@emailResults = 1)
+begin
+	if (@returnOnlyUncomplete = 0)
+	begin
+		if exists( select top 1 * from #JobStreamStaging)
+		begin
+			set @xml = cast(( select 
+								JobName as 'td', '',
+								JobDesc as 'td', '',
+								UserID as 'td', '',
+								Command as 'td', '',
+								StartTime as 'td', '',
+								EndTime as 'td', '',
+								[Status] as 'td', '',
+								Error as 'td', '',
+								JobStepDesc as 'td', '',
+								JobStepSeqNo as 'td'
+							from
+								#JobStreamStaging
+							order by
+								StartTime desc
+								,EndTime desc
+								,JobStepSeqNo desc
+							for xml path('tr'), elements ) as nvarchar(max))
+
+			set @body = '<html>
+							<body>
+								 <table border = 1>
+									<tr>
+										<th>JobName</th> 
+										<th>JobDesc</th> 
+										<th>UserID</th>
+										<th>Command</th> 
+										<th>StartTime</th> 
+										<th>EndTime</th>
+										<th>Status</th> 
+										<th>Error</th> 
+										<th>JobStepDesc</th>
+										<th>JobStepSeqNo</th>'
+
+			set @body = @body + @xml + '</table></body><html>'
+
+			set @subject = @server + ': Current Running Queries'
+
+			exec msdb..sp_send_dbmail
+				@profile_name = @emailProfile		
+				,@recipients = @operator_email
+				,@subject = @subject
+				,@body = @body
+				,@body_format = 'HTML'
+		end
+	end
+
+	else
+	
+	begin
+		---------------------------------------------------------------------------------
+		--will return currently running jobs as well as jobs that were 
+		--skipped / didn't run at all, or failed to complete their last step
+		---------------------------------------------------------------------------------
+		if exists(select top 1 * 
+				 from (select 
+							jm.job_int_id
+							,JobName = jm.name
+							,TotalNumOfSteps = count(*)
+							,FirstActiveStep = min(step.sequence_no)
+							,LastActiveStep = max(step.sequence_no)
+						from TJS100_JOBMASTER jm 
+						left join 
+							TJS101_JOBSTEP step on
+							jm.job_int_id = step.job_int_id
+						where
+							jm.row_sta_cd = 'A'
+							and jm.name in (select JobName from #NightlyJobs)
+							and step.row_sta_cd = 'A'
+						group by
+							jm.name
+							,jm.job_int_id) allJobs
+						left join
+							(select distinct job_int_id, LastJobStepRan
+							 from #JobStreamStaging) stat on
+							 stat.job_int_id = allJobs.job_int_id 
+							 and stat.LastJobStepRan = allJobs.LastActiveStep
+						left join
+							#JobStreamStaging js on
+							js.job_int_id = allJobs.job_int_id
+						left join
+							#JobStreamCurrentlyRunning jscr on
+							jscr.job_int_id = allJobs.job_int_id
+					where
+						stat.LastJobStepRan is null)
+		begin
+			set @xml = cast((select 
+								allJobs.JobName as 'td', '',
+								coalesce(jscr.JobDesc,js.JobDesc,'') as 'td', '',
+								coalesce(jscr.UserID,js.UserID,'') as 'td', '',
+								coalesce(jscr.StepCommand,js.Command,'') as 'td', '',
+								case when coalesce(jscr.JobStatusStartTime, js.StartTime) is null then '' else convert(varchar,coalesce(jscr.JobStatusStartTime, js.StartTime),120) end  as 'td', '',
+								case when js.EndTime is null then '' else convert(varchar,js.EndTime,120) end as 'td', '', 
+								coalesce(jscr.JobStatus, js.Status,'') as 'td', '',
+								coalesce(jscr.JobStatusError,js.Error,case when coalesce(jscr.JobStatusStartTime, js.StartTime) is not null then '' end, 'Job Not Started or Was Skipped / Disabled') as 'td', '',
+								coalesce(jscr.StepDesc,js.JobStepDesc,'') as 'td', '',
+								coalesce(jscr.StepSeqNo,js.JobStepSeqNo,'')  as 'td', '',
+								allJobs.FirstActiveStep as 'td', '',
+								allJobs.LastActiveStep as 'td', '',
+								TotalNumOfSteps as 'td', '',
+								isnull(jscr.JobRunDuration,'') as 'td', '',
+								isnull(jscr.MinutesSinceStatusUpdate,'') as 'td'
+							from 
+								(select 
+									jm.job_int_id
+									,JobName = jm.name
+									,TotalNumOfSteps = count(*)
+									,FirstActiveStep = min(step.sequence_no)
+									,LastActiveStep = max(step.sequence_no)
+								from TJS100_JOBMASTER jm 
+								left join 
+									TJS101_JOBSTEP step on
+									jm.job_int_id = step.job_int_id
+								where
+									jm.row_sta_cd = 'A'
+									and jm.name in (select JobName from #NightlyJobs)
+									and step.row_sta_cd = 'A'
+								group by
+									jm.name
+									,jm.job_int_id) allJobs
+								left join
+									(select distinct job_int_id, LastJobStepRan
+										from #JobStreamStaging) stat on
+										stat.job_int_id = allJobs.job_int_id 
+										and stat.LastJobStepRan = allJobs.LastActiveStep
+								left join
+									#JobStreamStaging js on
+									js.job_int_id = allJobs.job_int_id
+								left join
+									#JobStreamCurrentlyRunning jscr on
+									jscr.job_int_id = allJobs.job_int_id
+							where
+								stat.LastJobStepRan is null
+							--order seen in job status history tab in job stream
+							order by
+								coalesce(jscr.JobStatusStartTime, js.StartTime) desc
+								,js.EndTime desc
+								,coalesce(jscr.StepSeqNo,js.JobStepSeqNo) desc
+						for xml path('tr'), elements ) as nvarchar(max))
+			set @body = '<html>
+										<body>
+												<table border = 1>
+												<tr>
+													<th>JobName</th> 
+													<th>JobDesc</th> 
+													<th>UserID</th>
+													<th>Command</th> 
+													<th>StartTime</th> 
+													<th>EndTime</th>
+													<th>Status</th> 
+													<th>Error</th> 
+													<th>JobStepDesc</th>
+													<th>LastOrCurrentStep</th>
+													<th>FirstStepInJob</th>
+													<th>LastStepInJob</th> 
+													<th>TotalNumOfSteps</th> 
+													<th>JobRunDuration</th>
+													<th>MinutesSinceStatusUpdate</th>'
+
+			set @body = @body + @xml + '</table></body><html>'
+			set @subject = @server + ': Uncompleted / Skipped Job Stream Jobs'
+
+			exec msdb..sp_send_dbmail
+				@profile_name = @emailProfile		
+				,@recipients = @operator_email
+				,@subject = @subject
+				,@body = @body
+				,@body_format = 'HTML'
+		end
 	end
 end
+
+
+
