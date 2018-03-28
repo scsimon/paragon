@@ -1,26 +1,30 @@
+
 /*********************************************************************************************************************************
 Proc to alert an operator or email address of job stream status, history, etc... or can be used adhoc.
 
 //need to add logic for when a job never stops running (like FMR problem...) which causes it to look like it's skipped
 
 2018-03-26		S.Simon		Created Proc
+2018-03-28		S.Simon		Added one step in coalese for Error message to not be 'Job Not Started or Was Skipped / Disabled'
+							if the job was running. If the job is running but there was no error / status, this was being returned
+							which is false, because it is running
 *********************************************************************************************************************************/
 
 
-create procedure usp_job_stream_status(
-											@returnOnlyUncomplete bit = 1
-											,@returnCurrentlyRunning bit = 0
-											,@daysBack int = 1
-											,@nightlyStartTime time = '22:00:00'
-											,@operator varchar(16) = null
-											,@emails varchar(4000) = null
-											,@emailProfile varchar(28) = null
-											,@emailResults bit = 0)
+--alter procedure [dbo].[usp_job_stream_status](
+--											@returnOnlyUncomplete bit = 1
+--											,@returnCurrentlyRunning bit = 0
+--											,@daysBack int = 1
+--											,@nightlyStartTime time = '22:00:00'
+--											,@operator varchar(16) = null
+--											,@emails varchar(4000) = null
+--											,@emailProfile varchar(28) = null
+--											,@emailResults bit = 0)
+--
+--
+--as
 
 
-as
-
-/*
 declare @returnOnlyUncomplete bit = 1			--1 = jobs haven't completly finished or skipped | 0 = all results
 declare @returnCurrentlyRunning bit = 0			--0 = skipped | 1 = returns seperate set from above of only running / hung queries... not used in email alerts
 declare @daysBack int = 1						--Days back to return results. Set to 1 if running daily via job
@@ -30,7 +34,7 @@ declare @operator varchar(16) = null			--operator in SQL Server that gets emaile
 declare @emails varchar(4000) = null			--this is used if @operator isn't specified. @emails takes priority
 declare @emailProfile varchar(28) = null		--name of the DB Mail profile used to send emails from SQL Server
 declare @emailResults bit = 0					--1 emails, 0 returns results
-*/
+
 
 ---------------------------------------------------------------------------------
 --populate the jobs your org uses
@@ -269,6 +273,7 @@ where
 
 
 
+
 ---------------------------------------------------------------------------------
 --return results when no email is wanted
 ---------------------------------------------------------------------------------
@@ -330,7 +335,7 @@ begin
 			,StartTime = coalesce(jscr.JobStatusStartTime, js.StartTime) 
 			,js.EndTime 
 			,Status = coalesce(jscr.JobStatus, js.Status,'')
-			,Error = coalesce(jscr.JobStatusError,js.Error,'Job Not Started or Was Skipped / Disabled')
+			,Error = coalesce(jscr.JobStatusError,js.Error,case when coalesce(jscr.JobStatusStartTime, js.StartTime) is not null then '' end,'Job Not Started or Was Skipped / Disabled')
 			,JobStepDesc = coalesce(jscr.StepDesc,js.JobStepDesc,'')
 			,LastOrCurrentStep = coalesce(jscr.StepSeqNo,js.JobStepSeqNo,'') 
 			,FirstStepInJob = allJobs.FirstActiveStep
@@ -484,7 +489,7 @@ begin
 								case when coalesce(jscr.JobStatusStartTime, js.StartTime) is null then '' else convert(varchar,coalesce(jscr.JobStatusStartTime, js.StartTime),120) end  as 'td', '',
 								case when js.EndTime is null then '' else convert(varchar,js.EndTime,120) end as 'td', '', 
 								coalesce(jscr.JobStatus, js.Status,'') as 'td', '',
-								coalesce(jscr.JobStatusError,js.Error,'Job Not Started or Was Skipped / Disabled') as 'td', '',
+								coalesce(jscr.JobStatusError,js.Error,case when coalesce(jscr.JobStatusStartTime, js.StartTime) is not null then '' end, 'Job Not Started or Was Skipped / Disabled') as 'td', '',
 								coalesce(jscr.StepDesc,js.JobStepDesc,'') as 'td', '',
 								coalesce(jscr.StepSeqNo,js.JobStepSeqNo,'')  as 'td', '',
 								allJobs.FirstActiveStep as 'td', '',
@@ -561,9 +566,6 @@ begin
 		end
 	end
 end
-
-
-
 
 
 
