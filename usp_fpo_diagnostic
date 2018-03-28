@@ -44,7 +44,7 @@ select
 	Parameter = parm_ds
 	,ParameterCode = parm_ext_id
 	,DefaultValue = def_val_cd
-	,ParameterValue = case when fac_ctl_fg = 'N' then 'Default' else 'Changed by SAMC' end
+	,ParameterValue = case when fac_ctl_fg = 'N' then 'Default' else 'Changed by ORG' end
 	,LastModBy = lst_mod_id
 	,LastMod = lst_mod_ts
 	,TheTable = 'TSM990_SYS_PARMS'
@@ -80,7 +80,7 @@ select
 	,EnqueueStatus = isnull(cast(is_enqueue_enabled as int),0)			--Specifies whether new messages can be placed in the queue
 	,ActivationProcedure = activation_procedure
 	,TheTable = 'sys.service_queues'
-	,Resolution = case when is_enqueue_enabled = 0 or is_activation_enabled = 0 then 'Open a McKesson Service Order -- ALTER QUEUE <...> WITH STATUS = ON' end
+	,Resolution = case when is_enqueue_enabled = 0 or is_activation_enabled = 0 then 'Open a Service Order -- ALTER QUEUE <...> WITH STATUS = ON' end
 into #FPO_Queue
 from 
 	sys.service_queues
@@ -95,7 +95,7 @@ begin
 	set @body = '<h2>The service broker for paragon on is disabled</h2>'
 
 	exec msdb..sp_send_dbmail
-	@profile_name = 'HIS_SQL_STARTUP'			
+	@profile_name = @profileName			
 	,@recipients = @operator_email
 	,@subject = 'Service Broker Alert'
 	,@body = @body
